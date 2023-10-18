@@ -1,0 +1,697 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Resources:
+
+  FilesArchiveQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: FilesArchiveQueue
+
+  FilesArchive:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: user_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_key
+          KeyType: HASH
+      TableName: FilesArchive
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TimeToLiveSpecification:
+        AttributeName: ttl  # Use the name of your TTL attribute here
+        Enabled: true
+
+  FilesArchiveS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: filesarchivebucket
+
+
+  handleS3FilesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: handleS3FilesLambda
+      Role: arn:aws:iam::000060660976:role/LabRole
+      Runtime: python3.11
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          from botocore.exceptions import ClientError
+          import base64
+          import tempfile
+          import os
+
+          s3Client = boto3.client('s3')
+          bucket_name = 'filesarchivebucket'
+          sqsClient = boto3.client('sqs')
+          queue_name = "FilesArchiveQueue"
+
+
+          class CustomError(Exception):
+              def __init__(self, status_code, message):
+                  self.status_code = status_code
+                  self.message = message
+
+          def lambda_handler(event, context):
+              try:
+                  # print(event)
+                  base64_string = event['filename']
+                  # print(filename)
+                  user_key = event['user_key']
+                  # print(user_key)
+                  # print(check_key_exists(filename))
+                  password = event['password']
+                  url_expiry = event['url_expiry']
+                  
+                  filepath = base64_to_file(base64_string, user_key)
+                  print(filepath)
+                  
+                  if(check_s3_bucket_exists(bucket_name)):
+                      
+                      # print(check_key_exists(filename))
+                      if not check_key_exists(user_key):
+                          # Upload the file to S3 using the filepath
+                          with open(filepath, 'rb') as file:
+                              s3Client.put_object(Bucket=bucket_name, 
+                                                  Key=user_key,
+                                                  Body=file,
+                                                  Metadata={'user_key': user_key})
+                      
+                      presigned_url = create_presigned_url(bucket_name, user_key, url_expiry)
+                      print(presigned_url)
+                      
+                      
+                      response = send_message_to_sqs_queue(user_key, presigned_url, password, url_expiry)
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Hello from Lambda!')
+                      }
+                      
+              except CustomError as cust_error:
+                  return{
+                      'statusCode': cust_error.status_code,
+                      'body': json.dumps(cust_error.message)
+                  }
+              
+              except Exception as e:
+                  return {
+                      'status_code': 500,
+                      'body': json.dumps('An error occurred: ' + str(e))
+                  }
+
+
+          def check_s3_bucket_exists(bucket_name):
+              try:
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket(bucket_name)
+                  print(bucket.creation_date)
+                  if(bucket.creation_date):
+                      return True
+                  else:
+                      raise CustomError(404,f"{bucket_name} Bucket Not found")
+              
+              except Exception as e:
+                  raise CustomError(e.status_code, e.message)
+                  
+
+          def check_key_exists(filename):
+              try:
+                  response = s3Client.head_object(Bucket=bucket_name, Key=filename)
+                  
+                  if 'LastModified' in response:
+                      raise CustomError(409, f'{filename} already exists')
+              except ClientError as e:
+                  if e.response['Error']['Code'] == '404':
+                      return False  # File doesn't exist
+                  else:
+                      raise CustomError(500, f"Error checking key: {str(e)}")
+              except Exception as e:
+                  raise CustomError(e.status_code, e.message)
+
+
+
+          def create_presigned_url(bucket_name, filename, url_expiry):
+              """Generate a presigned URL to share an S3 object
+
+              :param bucket_name: string
+              :param object_name: string
+              :param expiration: Time in seconds for the presigned URL to remain valid
+              :return: Presigned URL as string. If error, returns None.
+              """
+
+              # Generate a presigned URL for the S3 object
+              try:
+                  response = s3Client.generate_presigned_url('get_object',
+                                                              Params={'Bucket': bucket_name,
+                                                                      'Key': filename},
+                                                              ExpiresIn=url_expiry)
+                  print(response)
+              except ClientError as e:
+                  # logging.error(e)
+                  raise CustomError(500, str(e))
+
+              # The response contains the presigned URL
+              return response   
+
+
+
+          def send_message_to_sqs_queue(user_key, presigned_url, password, url_expiry):
+              try:
+                  queue_url = f"https://sqs.us-east-1.amazonaws.com/000060660976/{queue_name}"
+                  print(queue_url)
+                  message_body = {
+                              'user_key': user_key,
+                              'presigned_url': presigned_url,
+                              'password': password,
+                              'url_expiry': url_expiry
+                          }
+                  response = sqsClient.send_message(    
+                      QueueUrl=queue_url,
+                      DelaySeconds=0,
+                      MessageBody= json.dumps(message_body)
+                  )
+                  return response
+              except ClientError as ce:
+                  raise CustomError(500, str(e))
+
+
+          def base64_to_file(base64_string, file_name):
+              try:
+                  # Decode the base64 string
+                  file_contents = base64.b64decode(base64_string)
+
+                  # Get a writable directory for the temporary file
+                  temp_dir = '/tmp'  # Use /tmp directory which is writable in Lambda
+                  
+                  # Create the temporary file with the specified name and directory
+                  temp_file_path = os.path.join(temp_dir, file_name)
+                  
+                  # Write the decoded data to the temporary file
+                  with open(temp_file_path, "wb") as file:
+                      file.write(file_contents)
+
+                  return temp_file_path  # Return the path of the temporary file
+              except Exception as e:
+                  raise CustomError(500, str(e))
+
+
+
+  retrieveFilesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: retrieveFilesLambda
+      Role: arn:aws:iam::000060660976:role/LabRole
+      Runtime: python3.11
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          dynamoClient = boto3.client('dynamodb')
+          table_name = "FilesArchive"
+
+          def lambda_handler(event, context):
+              user_key = event['user_key']
+              response = check_if_key_exists_in_dynamodb(user_key)
+              return response
+
+
+          def check_if_key_exists_in_dynamodb(user_key):
+              try:
+                  response = dynamoClient.query(
+                      TableName=table_name,
+                      KeyConditionExpression='user_key = :value',
+                      ExpressionAttributeValues={':value': {'S': user_key}},
+                      ProjectionExpression='user_key',  # Only retrieve the user_key attribute
+                      Limit=1  # Limit the result to one item
+                  )
+
+                  if len(response.get('Items', [])) > 0:
+                      # If the item exists, return error
+                      return create_response(409, f"{user_key} already exists, choose a new one.")
+                  else:
+                      # If the user key doesn't exist, say that the key is available
+                      return create_response(200, f"{user_key} key is available.")
+
+              except Exception as e:
+                  return create_response(500, str(e))
+
+
+          def create_response(status_code, message):
+              return {
+                  'statusCode': status_code,
+                  'body': message
+              }                
+                            
+
+
+
+  insertToDynamoDbLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: insertToDynamoDbLambda
+      Role: arn:aws:iam::000060660976:role/LabRole
+      Runtime: python3.11
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          from botocore.exceptions import ClientError
+          import time
+
+          s3Client = boto3.client('s3') 
+          dynamoClient = boto3.client('dynamodb')
+          table_name = "FilesArchive"
+          sqsClient = boto3.client('sqs')
+          queue_name = "FilesArchiveQueue"
+
+          def lambda_handler(event, context):
+              
+              print(event['Records'][0]['body'])
+              item = event['Records'][0]['body']
+              print(type(item))
+              item_json = json.loads(item)
+              print(type(item_json))
+              print(item_json['user_key'])
+              print(item_json['presigned_url'])
+              print(item_json['password'])
+              print(item_json['url_expiry'])
+              print(type(item_json['url_expiry']))
+              try:
+                  response = write_item_to_dynamo_db(table_name, item_json)
+                  print(response)
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Hello from Lambda!')
+                  }
+              except ClientError as e:
+                  logging.error(e)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('An error occurred: ' + str(e))
+                  }
+
+
+                  
+          def write_item_to_dynamo_db( table_name, item_json ):
+              try:
+                  user_key = item_json['user_key']
+                  presigned_url = item_json['presigned_url']
+                  password = item_json['password']
+                  url_expiry = item_json['url_expiry']
+                  
+                  # Calculate the TTL based on the current time and url_expiry
+                  current_time = int(time.time())  # Current epoch timestamp in seconds
+                  ttl = current_time + url_expiry
+                  
+                  # Check if the item with the given email exists
+                  response = dynamoClient.get_item(TableName=table_name, Key={'user_key':{'S':user_key}})
+                  if 'Item' in response:
+                      # If the item exists, return error
+                      return {
+                          'statusCode': 409,
+                          'body': response['Item']
+                          
+                      }
+                  else:
+                      # If the user key doesn't exist, insert the new user key and file presigned url into DynamoDB
+                      dynamoClient.put_item(TableName=table_name, 
+                                              Item={'user_key':{'S':user_key},
+                                              'presigned_url':{'S':presigned_url}, 
+                                              'password':{'S':password}, 
+                                              'ttl': {'N': str(ttl)} })
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(f"{user_key} key and presigned url of file inserted successfully.")
+                      }
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f"Error inserting key '{user_key}': {e}")
+                  }
+
+
+
+
+  insertToDynamoDbEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1  # Number of messages to process in each batch
+      EventSourceArn: !GetAtt FilesArchiveQueue.Arn  # ARN of the SQS queue
+      FunctionName: !GetAtt insertToDynamoDbLambda.Arn  # ARN of the Lambda function
+
+
+
+
+  checkKeyAvailabilityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: checkKeyAvailabilityLambda
+      Role: arn:aws:iam::000060660976:role/LabRole
+      Runtime: python3.11
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          dynamoClient = boto3.client('dynamodb')
+          table_name = "FilesArchive"
+
+          def lambda_handler(event, context):
+              print(event['user_key'])
+              user_key = event['user_key']
+              
+              print(check_if_key_exists_in_dynamodb(user_key))
+              response = check_if_key_exists_in_dynamodb(user_key)
+              return response
+
+
+          def check_if_key_exists_in_dynamodb(user_key):
+              try:
+                  # Check if the item with the given email exists
+                  response = dynamoClient.get_item(TableName=table_name, Key={'user_key':{'S':user_key}})
+                  if 'Item' in response:
+                      # If the item exists, return error
+                      return create_response(409, f"{user_key} already exists, choose a new one.")
+                  else:
+                      # If the user key doesn't exist, say that the key is available
+                     return create_response(200, f"{user_key} key is available.")
+                     
+              except Exception as e:
+                  print(str(e))
+                  return create_response(500, str(e))
+
+
+          def create_response(status_code, message):
+              return {
+                  'statusCode': status_code,
+                  'body': message
+              }
+
+
+  FilesArchiveApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: 'FilesArchiveApiGateway'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  CheckKeyAvailabilityResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FilesArchiveApiGateway
+      ParentId: !GetAtt 
+        - FilesArchiveApiGateway
+        - RootResourceId
+      PathPart: checkkeyavailability
+    DependsOn:
+      - FilesArchiveApiGateway
+
+  apiCORSOptionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref CheckKeyAvailabilityResource
+      RestApiId: !Ref FilesArchiveApiGateway
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+            StatusCode: '200'
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+
+  CheckKeyAvailabilityMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref CheckKeyAvailabilityResource
+      RestApiId: !Ref FilesArchiveApiGateway
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${checkKeyAvailabilityLambda}/invocations
+          - checkKeyAvailabilityLambda: !GetAtt checkKeyAvailabilityLambda.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+    DependsOn:
+      - CheckKeyAvailabilityResource
+      - checkKeyAvailabilityLambda
+
+  CheckKeyAvailabilityDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref FilesArchiveApiGateway
+      StageName: dev
+    DependsOn:
+      - CheckKeyAvailabilityMethod
+
+  CheckKeyAvailabilityResourcePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref checkKeyAvailabilityLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FilesArchiveApiGateway}/*/*/*"
+    DependsOn:
+      - CheckKeyAvailabilityDeployment
+
+  retrieveFilesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FilesArchiveApiGateway
+      ParentId: !GetAtt 
+        - FilesArchiveApiGateway
+        - RootResourceId
+      PathPart: retrievefiles
+    DependsOn:
+      - FilesArchiveApiGateway
+
+
+  retrieveCORSOptionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref retrieveFilesResource
+      RestApiId: !Ref FilesArchiveApiGateway
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+            StatusCode: '200'
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+
+  retrieveFilesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref retrieveFilesResource
+      RestApiId: !Ref FilesArchiveApiGateway
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${retrieveFilesLambda}/invocations
+          - retrieveFilesLambda: !GetAtt retrieveFilesLambda.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+    DependsOn:
+      - retrieveFilesResource
+      - retrieveFilesLambda
+
+  retrieveFilesDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref FilesArchiveApiGateway
+      StageName: dev
+    DependsOn:
+      - retrieveFilesMethod
+
+  retrieveFilesResourcePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref retrieveFilesLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FilesArchiveApiGateway}/*/*/*"
+    DependsOn:
+      - retrieveFilesDeployment
+
+
+  saveFilesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FilesArchiveApiGateway
+      ParentId: !GetAtt 
+        - FilesArchiveApiGateway
+        - RootResourceId
+      PathPart: saveFiles
+    DependsOn:
+      - FilesArchiveApiGateway
+
+  saveAPICORSOptionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref saveFilesResource
+      RestApiId: !Ref FilesArchiveApiGateway
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+            StatusCode: '200'
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+
+  saveFilesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref saveFilesResource
+      RestApiId: !Ref FilesArchiveApiGateway
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${handleS3FilesLambda}/invocations
+          - handleS3FilesLambda: !GetAtt handleS3FilesLambda.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: '200'
+    DependsOn:
+      - saveFilesResource
+      - handleS3FilesLambda
+
+  saveFilesDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref FilesArchiveApiGateway
+      StageName: dev
+    DependsOn:
+      - saveFilesMethod
+
+  saveFilesResourcePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref handleS3FilesLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FilesArchiveApiGateway}/*/*/*"
+    DependsOn:
+      - saveFilesDeployment
